@@ -1,0 +1,374 @@
+HTML
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>30초 피하기 미니게임</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        html, body {
+            width: 100%;
+            height: 100%;
+            background-color: #1a1a1a;
+            color: #ffffff;
+            font-family: monospace;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+        #uiControlBar {
+            margin-bottom: 8px;
+            display: flex;
+            gap: 15px;
+            font-size: 13px;
+        }
+        #uiControlBar label {
+            cursor: pointer;
+            user-select: none;
+        }
+        #canvasContainer {
+            width: 100%;
+            height: 100%;
+            max-width: 100vw;
+            max-height: 90vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        canvas {
+            border: 2px solid #ffffff;
+            background-color: #000000;
+            max-width: 98vw;
+            max-height: 90vh;
+            aspect-ratio: 480 / 640;
+            object-fit: contain;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 음소거 및 움직임 줄이기 옵션 UI -->
+    <div id="uiControlBar">
+        <label><input type="checkbox" id="muteToggle"> 🔇 음소거 [M]</label>
+        <label><input type="checkbox" id="reducedMotionToggle"> 🛑 움직임 줄이기 (화면 흔들림 끄기)</label>
+    </div>
+
+    <div id="canvasContainer">
+        <canvas id="gameCanvas" width="480" height="640"></canvas>
+    </div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const muteToggle = document.getElementById('muteToggle');
+const reducedMotionToggle = document.getElementById('reducedMotionToggle');
+
+// Web Audio API 1회성 효과음 제어
+const AudioContext = window.AudioContext || window.webkitAudioContext;
+let audioCtx = null;
+
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new AudioContext();
+    }
+}
+
+// 효과음 재생 함수. 음소거 시 즉시 중단
+function playSound(type) {
+    if (muteToggle.checked) return; // 음소거 체크 시 무음
+    initAudio();
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+
+    const now = audioCtx.currentTime;
+
+    if (type === 'hit') { // 충돌 사건
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(150, now);
+        osc.frequency.exponentialRampToValueAtTime(40, now + 0.2);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.2);
+        osc.start(now);
+        osc.stop(now + 0.2);
+    } else if (type === 'success') { // 성공 사건
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(440, now);
+        osc.frequency.setValueAtTime(880, now + 0.1);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.3);
+        osc.start(now);
+        osc.stop(now + 0.3);
+    }
+}
+
+// 화면 흔들림(Shake) 효과
+let shakeDuration = 0;
+
+function triggerShake() {
+    if (reducedMotionToggle.checked) return; // [T02-C27] 움직임 줄이기 켜짐 시 화면 흔들림 방지
+    shakeDuration = 0.2; // 0.2초간만 흔들림
+}
+
+// 저장소 관련
+const STORAGE_KEY = 'MINI_GAME_SAVE_DATA';
+const DEFAULT_SAVE_DATA = { highScore: 0, totalPlayCount: 0 };
+
+function loadSaveData() {
+    try {
+        const rawData = localStorage.getItem(STORAGE_KEY);
+        if (!rawData) return { ...DEFAULT_SAVE_DATA };
+        const parsed = JSON.parse(rawData);
+        if (typeof parsed !== 'object' || parsed === null ||
+            typeof parsed.highScore !== 'number' || isNaN(parsed.highScore) ||
+            typeof parsed.totalPlayCount !== 'number' || isNaN(parsed.totalPlayCount)) {
+            return { ...DEFAULT_SAVE_DATA };
+        }
+        return parsed;
+    } catch (e) {
+        return { ...DEFAULT_SAVE_DATA };
+    }
+}
+
+function saveGameData(data) {
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {}
+}
+
+let persistentData = loadSaveData();
+
+const DIFFICULTY_CONFIG = {
+    spawnInterval: 0.35,
+    playerSpeed: 300,
+    gameDuration: 20
+};
+
+let gameState = 'READY';
+
+const player = {
+    x: canvas.width / 2 - 15,
+    y: canvas.height - 50,
+    size: 30,
+    speed: DIFFICULTY_CONFIG.playerSpeed
+};
+
+let obstacles = [];
+let remainingTime = DIFFICULTY_CONFIG.gameDuration;
+let currentScore = 0;
+let lastTime = 0;
+let obstacleTimer = 0;
+
+const keys = { ArrowLeft: false, ArrowRight: false, a: false, d: false };
+
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'm' || e.key === 'M') {
+        muteToggle.checked = !muteToggle.checked;
+        return;
+    }
+    if (e.key === 'P' || e.key === 'p') {
+        if (!e.repeat) togglePause();
+        return;
+    }
+    if (gameState === 'READY' && e.code === 'Space') {
+        if (!e.repeat) startGame();
+    } else if ((gameState === 'SUCCESS' || gameState === 'FAILED') && (e.key === 'r' || e.key === 'R')) {
+        if (!e.repeat) resetGame();
+    }
+    if (keys.hasOwnProperty(e.key)) keys[e.key] = true;
+});
+
+window.addEventListener('keyup', (e) => {
+    if (keys.hasOwnProperty(e.key)) keys[e.key] = false;
+});
+
+window.addEventListener('blur', () => {
+    if (gameState === 'PLAYING') gameState = 'PAUSED';
+    Object.keys(keys).forEach(k => keys[k] = false);
+});
+
+window.addEventListener('focus', () => { lastTime = performance.now(); });
+
+function togglePause() {
+    if (gameState === 'PLAYING') gameState = 'PAUSED';
+    else if (gameState === 'PAUSED') {
+        gameState = 'PLAYING';
+        lastTime = performance.now();
+    }
+}
+
+function startGame() {
+    gameState = 'PLAYING';
+    remainingTime = DIFFICULTY_CONFIG.gameDuration;
+    currentScore = 0;
+    obstacles = [];
+    obstacleTimer = 0;
+    player.x = canvas.width / 2 - 15;
+    
+    persistentData.totalPlayCount++;
+    saveGameData(persistentData);
+    lastTime = performance.now();
+}
+
+function resetGame() {
+    player.x = canvas.width / 2 - 15;
+    obstacles = [];
+    remainingTime = DIFFICULTY_CONFIG.gameDuration;
+    currentScore = 0;
+    gameState = 'READY';
+    lastTime = performance.now();
+}
+
+function update(dt) {
+    if (shakeDuration > 0) {
+        shakeDuration -= dt;
+        if (shakeDuration < 0) shakeDuration = 0;
+    }
+
+    if (gameState !== 'PLAYING') return;
+
+    remainingTime -= dt;
+    currentScore = Math.floor((DIFFICULTY_CONFIG.gameDuration - remainingTime) * 10);
+
+    // 성공 사건 시점에만 효과 1회 실행
+    if (remainingTime <= 0) {
+        remainingTime = 0;
+        currentScore = 200;
+        gameState = 'SUCCESS';
+        playSound('success');
+        if (currentScore > persistentData.highScore) {
+            persistentData.highScore = currentScore;
+            saveGameData(persistentData);
+        }
+        return;
+    }
+
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) player.x -= player.speed * dt;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) player.x += player.speed * dt;
+
+    if (player.x < 0) player.x = 0;
+    if (player.x + player.size > canvas.width) player.x = canvas.width - player.size;
+
+    obstacleTimer += dt;
+    if (obstacleTimer >= DIFFICULTY_CONFIG.spawnInterval) {
+        obstacleTimer = 0;
+        const size = Math.random() * 20 + 15;
+        obstacles.push({
+            x: Math.random() * (canvas.width - size),
+            y: -size,
+            size: size,
+            speed: Math.random() * 100 + 200
+        });
+    }
+
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+        let obs = obstacles[i];
+        obs.y += obs.speed * dt;
+
+        // 충돌/실패 사건 시점에만 효과 1회 트리거
+        if (
+            player.x < obs.x + obs.size &&
+            player.x + player.size > obs.x &&
+            player.y < obs.y + obs.size &&
+            player.y + player.size > obs.y
+        ) {
+            gameState = 'FAILED';
+            playSound('hit');
+            triggerShake();
+            
+            if (currentScore > persistentData.highScore) {
+                persistentData.highScore = currentScore;
+                saveGameData(persistentData);
+            }
+            return;
+        }
+
+        if (obs.y > canvas.height) {
+            obstacles.splice(i, 1);
+        }
+    }
+}
+
+function render() {
+    ctx.save();
+
+    // 화면 흔들림 오프셋
+    if (shakeDuration > 0 && !reducedMotionToggle.checked) {
+        const dx = (Math.random() - 0.5) * 10;
+        const dy = (Math.random() - 0.5) * 10;
+        ctx.translate(dx, dy);
+    }
+
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '14px monospace';
+    ctx.fillText(`상태: ${gameState}`, 15, 25);
+    ctx.fillText(`남은 시간: ${Math.ceil(remainingTime)}초 | 현재 점수: ${currentScore}`, 15, 45);
+    ctx.fillText(`최고 점수: ${persistentData.highScore} | 누적 플레이: ${persistentData.totalPlayCount}회`, 15, 65);
+    ctx.fillText(`조작: ←/→ | P:일시정지 | M:음소거`, 15, canvas.height - 15);
+
+    ctx.fillStyle = '#00aaff';
+    ctx.fillRect(player.x, player.y, player.size, player.size);
+
+    ctx.fillStyle = '#ff4444';
+    for (let obs of obstacles) {
+        ctx.fillRect(obs.x, obs.y, obs.size, obs.size);
+    }
+
+    if (gameState === 'READY') {
+        drawOverlay('미니 피하기 게임', '스페이스바를 눌러 시작하세요');
+    } else if (gameState === 'PAUSED') {
+        drawOverlay('일시 정지 (PAUSED)', 'P 키를 눌러 재개하세요');
+    } else if (gameState === 'SUCCESS') {
+        drawOverlay('성공! (SUCCESS)', 'R 키를 눌러 다시 시작');
+    } else if (gameState === 'FAILED') {
+        drawOverlay('실패! (FAILED)', 'R 키를 눌러 다시 시작');
+    }
+
+    ctx.restore();
+}
+
+function drawOverlay(title, subtitle) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+    ctx.fillRect(0, 150, canvas.width, 200);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 22px monospace';
+    ctx.fillText(title, canvas.width / 2, 230);
+    ctx.font = '14px monospace';
+    ctx.fillText(subtitle, canvas.width / 2, 280);
+    ctx.textAlign = 'left';
+}
+
+function gameLoop(currentTime) {
+    if (!lastTime) lastTime = currentTime;
+    let dt = (currentTime - lastTime) / 1000;
+    if (dt > 0.1) dt = 0.1;
+
+    update(dt);
+    render();
+
+    lastTime = currentTime;
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
